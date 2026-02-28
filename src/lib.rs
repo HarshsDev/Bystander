@@ -49,7 +49,7 @@ pub trait NormalizedLockFree {
         &self,
         op: &Self::Input,
         contention: &mut ContentionMeasure,
-    ) -> Result<Self::Output, Contention>;
+    ) -> Result<Self::cases, Contention>;
     // fn execute(
     //     &self,
     //     cases:Self::Descriptor,
@@ -159,7 +159,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                 OperationState::Completed(..) => {
                     let _ = self.help.try_remove_front(orb);
                     return;
-                },
+                }
                 OperationState::PreCas => {
                     //  let mut updated_or = Box::new(or.clone());
                     let cas_list = match self
@@ -176,7 +176,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                         input: or.input.clone(),
                         state: OperationState::ExecuteCas(cas_list),
                     })
-                },
+                }
                 OperationState::ExecuteCas(cas_list) => {
                     let outcome = self.cas_executor(cas_list, &mut ContentionMeasure(0));
                     Box::new(OperationRecord {
@@ -184,38 +184,33 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                         input: or.input.clone(),
                         state: OperationState::PostCas(cas_list.clone(), outcome),
                     })
-                },
+                }
                 OperationState::PostCas(cas_list, outcome) => {
-                     
-                     match self.algorithm
-                            .wrap_up(*outcome, cas_list, &mut ContentionMeasure(0))
+                    match self
+                        .algorithm
+                        .wrap_up(*outcome, cas_list, &mut ContentionMeasure(0))
                     {
-                        Ok(Some(result)) =>{
-                        Box::new(OperationRecord {
+                        Ok(Some(result)) => Box::new(OperationRecord {
                             owner: or.owner.clone(),
                             input: or.input.clone(),
                             state: OperationState::Completed(result),
-                        })
-                    },
-                    Ok(None) => {
-                        Box::new(OperationRecord {
+                        }),
+                        Ok(None) => Box::new(OperationRecord {
                             owner: or.owner.clone(),
                             input: or.input.clone(),
                             state: OperationState::PreCas,
-                        })
-                    },
-                    Err(Contention) => {
-                        continue;
+                        }),
+                        Err(Contention) => {
+                            continue;
+                        } // } else {
+                          // Box::new(OperationRecord {
+                          //     owner: or.owner.clone(),
+                          //     input: or.input.clone(),
+                          //     state: OperationState::PreCas,
+                          // })
+                          // }
                     }
-                    // } else {
-                        // Box::new(OperationRecord {
-                        //     owner: or.owner.clone(),
-                        //     input: or.input.clone(),
-                        //     state: OperationState::PreCas,
-                        // })
-                    // }
                 }
-            }
             };
             let updated_or = Box::into_raw(updated_or);
             if orb
@@ -232,7 +227,6 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
             }
         }
     }
-}
 
     pub fn help(&self) {
         if let Some(help) = self.help.peek() {
@@ -259,7 +253,13 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
             let mut contention = ContentionMeasure(0);
 
             //  if contention.use_slow_path() {}
-            let cases = self.algorithm.generate(&op, &mut contention);
+            let cases = match self.algorithm.generate(&op, &mut contention) {
+                Ok(c) => c,
+                Err(Contention) => {
+                    // generation failed due to contention; retry
+                    continue;
+                }
+            };
             if contention.use_slow_path() {
                 break;
             }
@@ -270,8 +270,9 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
             }
 
             match self.algorithm.wrap_up(result, &cases, &mut contention) {
-                Ok(outcome) => return outcome,
-                Err(()) => {}
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                Err(Contention) => {}
             }
             if contention.use_slow_path() {
                 break;
@@ -321,7 +322,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                 self.help();
             }
         }
-    
+
         // while !unsafe { &*orb.val.load(Ordering::SeqCst) }
         //     .state
         //     .is_completed()
