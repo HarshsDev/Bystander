@@ -1,9 +1,11 @@
+use std::{clone, result};
+// use std::intrinsics::simd::simd_bitmask;
 // use std::clone;
 use std::marker::PhantomData;
 use std::ops::Index;
 // use std::process::Output;
-use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{self};
+use std::sync::atomic::{AtomicPtr, AtomicU8};
 
 const CONTENTION_THRESHOLD: usize = 2;
 const RETRY_THRESHOLD: usize = 2;
@@ -27,29 +29,245 @@ impl ContentionMeasure {
     }
 }
 
-pub trait CasDescriptor {
-    fn execute(&self) -> Result<(), ()>;
+// pub trait Cas {
+//    // type Meta;
+//     fn execute(&self) -> Result<(), ()>;
+// }
+
+#[repr(u8)]
+#[derive(PartialEq, Clone, Debug)]
+enum CasState {
+    Success,
+    Failure,
+    Pending,
 }
 
-pub trait CasDescriptors<D>: Index<usize, Output = D>
+struct CasByRcu<T> {
+    //cond for doing wap
+    version: u64,
+    // meta: M,
+
+    //the value to cas
+    value: T,
+}
+
+// struct TripleMarked<T> {
+//     value:T,
+//     mark: bool,
+//     flag: bool,
+//     help: bool,
+// }
+
+// pub struct VersionedTripleMarkRefernce<T> (Atomic<TripleMarked<T>>);
+
+// impl<T> VersionedTripleMarkRefernce<T> {
+//     pub fn new(value: T, mark:bool, flag: bool, help:bool) -> Self {
+//         Self(Atomic::new(TripleMarked { value, mark, flag, help }))
+//     }
+
+//     pub fn get_reference(&self) -> &T {
+//         self.0.
+//     }
+// }
+
+pub struct Atomic<T>(AtomicPtr<CasByRcu<T>>);
+
+pub trait VersionedCas {
+    fn execute(&self, contention: &mut ContentionMeasure) -> Result<bool, Contention>;
+    fn has_modified_bit(&self) -> bool;
+    fn clear_bit(&self) -> bool;
+    fn state(&self) -> CasState;
+    fn set_state(&self, new: CasState);
+}
+
+// struct TripleMarked<T> {
+//     value:T,
+//     mark: bool,
+//     flag: bool,
+//     help: bool,
+// }
+
+// pub struct VersionedTripleMarkRefernce<T> (Atomic<TripleMarked<T>>);
+
+// impl<T> VersionedTripleMarkRefernce<T> {
+//     pub fn new(value: T, mark:bool, flag: bool, help:bool) -> Self {
+//         Self(Atomic::new(TripleMarked { value, mark, flag, help }))
+//     }
+
+//     pub fn get_reference(&self) -> &T {
+//         self.0.with(|(v,_)| &v.value)
+//     }
+
+//     pub fn is_marked(&self) -> bool {
+//         self.0.with(|(v,_)| v.mark)
+//     }
+
+//      pub fn is_help(&self) -> bool {
+//         self.0.with(|(v,_)| v.help)
+//     }
+
+//      pub fn is_flag(&self) -> bool {
+//         self.0.with(|(v,_)| v.flag)
+//     }
+// }
+
+impl<T> Atomic<T>
 where
-    D: CasDescriptor,
+    T: PartialEq + Eq + Copy,
 {
-    fn len(&self) -> usize {
+    pub fn new(initial: T) -> Self {
+        Self(AtomicPtr::new(Box::into_raw(Box::new(CasByRcu {
+            version: 0,
+            value: initial,
+        }))))
+    }
+
+    pub fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T, u64) -> R,
+    {
+        let this_ptr = self.get();
+        let this = unsafe { &*this_ptr };
+        f(&this.value, this.version)
+    }
+
+    // fn is_help_in_version(&self, version: usize) {
+    //     self.with(|(_, mfh, v)| v == version && mfh.help)
+    // }
+
+    fn get(&self) -> *mut CasByRcu<T> {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn value(&self) -> &T {
+        &unsafe { &*self.get() }.value
+    }
+
+    // pub fn meta(&self) -> &M {
+    //     &unsafe { &*self.0.load(Ordering::SeqCst) }.meta
+    // }
+
+    pub fn set(&self, new: T) {
+        let this_ptr = self.0.load(Ordering::SeqCst);
+        let this = unsafe { &*this_ptr };
+        if this.value != new {
+            self.0.store(
+                Box::into_raw(Box::new(CasByRcu {
+                    version: this.version + 1,
+                    // meta: new_meta,
+                    value: new,
+                })),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    pub fn compare_and_set(&self, expected: &T, value: T) -> bool {
+        let this_ptr = self.0.load(Ordering::SeqCst);
+        let this = unsafe { &*this_ptr };
+        if this.value == *expected {
+            if *expected != value {
+                self.0.compare_exchange(
+                    this_ptr,
+                    Box::into_raw(Box::new(CasByRcu {
+                        version: this.version + 1,
+                        // meta: new_meta,
+                        value,
+                    })),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn compare_and_set_versioned(
+        &self,
+        expected: &T,
+        value: T,
+        contention: &mut ContentionMeasure,
+        version: Option<u64>,
+    ) -> Result<bool, Contention> {
+        let this_ptr = self.0.load(Ordering::SeqCst);
+        let this = unsafe { &*this_ptr };
+        if &this.value == expected {
+            if let Some(v) = version {
+                if v != this.version {
+                    contention.detected()?;
+                    return Ok(false);
+                }
+            }
+            if expected == &value {
+                return Ok(true);
+            } else {
+                let new_ptr = Box::into_raw(Box::new(CasByRcu {
+                    version: this.version + 1,
+                    value,
+                }));
+                match self.0.compare_exchange(
+                    this_ptr,
+                    new_ptr,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => Ok(true),
+                    Err(current) => {
+                        let _ = unsafe {
+                            Box::from_raw(new_ptr);
+                        };
+                        contention.detected()?;
+                        Ok(false)
+                    }
+                }
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn execute(&self) -> bool {
+        todo!()
+    }
+
+    fn has_modified_bit(&self) -> bool {
+        todo!()
+    }
+
+    fn clear_bit(&self) -> bool {
+        todo!()
+    }
+
+    fn set_state(&self, new: &CasState) {
+        todo!()
+    }
+
+    fn state(&self) -> CasState {
         todo!()
     }
 }
 
+// pub trait CasDescriptors<D>: Index<usize, Output = D>
+// where
+//     DCas:
+// {
+//     fn len(&self) -> usize {
+//         todo!()
+//     }
+// }
+
 pub trait NormalizedLockFree {
     type Input: Clone;
     type Output: Clone;
-    type cas: CasDescriptor;
-    type cases: CasDescriptors<Self::cas> + Clone;
+    // type cas: CasDescriptor;
+    type CommitDescriptor: Clone;
     fn generate(
         &self,
         op: &Self::Input,
         contention: &mut ContentionMeasure,
-    ) -> Result<Self::cases, Contention>;
+    ) -> Result<Self::CommitDescriptor, Contention>;
     // fn execute(
     //     &self,
     //     cases:Self::Descriptor,
@@ -59,7 +277,13 @@ pub trait NormalizedLockFree {
     fn wrap_up(
         &self,
         executed: Result<(), usize>,
-        performed: &Self::cases,
+        performed: &Self::CommitDescriptor,
+        contention: &mut ContentionMeasure,
+    ) -> Result<Option<Self::Output>, Contention>;
+
+    fn fast_path(
+        &self,
+        op: &Self::Input,
         contention: &mut ContentionMeasure,
     ) -> Result<Option<Self::Output>, Contention>;
 }
@@ -72,8 +296,8 @@ struct WaitFreeSimulator<LF: NormalizedLockFree> {
 #[derive(Clone)]
 enum OperationState<LF: NormalizedLockFree> {
     PreCas,
-    ExecuteCas(LF::cases),
-    PostCas(LF::cases, Result<(), usize>),
+    ExecuteCas(LF::CommitDescriptor),
+    PostCas(LF::CommitDescriptor, Result<(), usize>),
     Completed(LF::Output),
 }
 
@@ -86,6 +310,7 @@ impl<LF: NormalizedLockFree> OperationState<LF> {
 struct OperationRecordBox<LF: NormalizedLockFree> {
     val: AtomicPtr<OperationRecord<LF>>,
 }
+
 struct OperationRecord<LF: NormalizedLockFree> {
     owner: std::thread::ThreadId,
     input: LF::Input,
@@ -98,7 +323,7 @@ impl<LF: NormalizedLockFree> Clone for OperationRecord<LF>
 where
     LF::Input: Clone,
     LF::Output: Clone,
-    LF::cases: Clone,
+    LF::CommitDescriptor: Clone,
     OperationState<LF>: Clone,
 {
     fn clone(&self) -> Self {
@@ -130,22 +355,39 @@ impl<LF: NormalizedLockFree> HelpQueue<LF> {
 }
 
 impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
-// where
-//     OperationRecord<LF>: Clone,
+where
+    for<'a> &'a LF::CommitDescriptor: IntoIterator<Item = &'a dyn VersionedCas>, // where
+                                                                                 //     OperationRecord<LF>: Clone,
 {
     fn cas_executor(
         &self,
-        descriptors: &LF::cases,
+        descriptors: &LF::CommitDescriptor,
         contention: &mut ContentionMeasure,
-    ) -> Result<(), usize> {
-        let len = descriptors.len();
-        for i in 0..len {
-            if descriptors[i].execute().is_err() {
-                contention.detected();
-                return Err(i);
+    ) -> Result<Result<(), usize>, Contention> {
+        // let len = descriptors.len();
+        for (i, cas) in descriptors.into_iter().enumerate() {
+            match cas.state() {
+                CasState::Success => {
+                    cas.clear_bit();
+                }
+                CasState::Failure => {
+                    return Ok(Err(i));
+                }
+                CasState::Pending => {
+                    cas.execute(contention)?;
+                    if cas.has_modified_bit() {
+                        cas.set_state(CasState::Success);
+                        cas.clear_bit();
+                    }
+
+                    if cas.state() != CasState::Success {
+                        cas.set_state(CasState::Failure);
+                        return Ok(Err(i));
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(Ok(()))
         // todo!()
     }
 
@@ -178,7 +420,11 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                     })
                 }
                 OperationState::ExecuteCas(cas_list) => {
-                    let outcome = self.cas_executor(cas_list, &mut ContentionMeasure(0));
+                    let outcome = match self.cas_executor(cas_list, &mut ContentionMeasure(0)) {
+                        Ok(outcome) => outcome,
+                        Err(Contention) => continue,
+                    };
+
                     Box::new(OperationRecord {
                         owner: or.owner.clone(),
                         input: or.input.clone(),
@@ -241,42 +487,54 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
 
         let mut fast = true;
         for retry in 0.. {
-            let help = true/*once in a while false*/ ;
-            if retry == 0 {
-                if help {
-                    self.help();
-                }
-            } else {
-            }
+            // let help = true/*once in a while false*/ ;
+            // if retry == 0 {
+            //     if help {
+            //         self.help();
+            //     }
+            // } else {
+            // }
 
-            fast = false;
+            // fast = false;
             let mut contention = ContentionMeasure(0);
 
-            //  if contention.use_slow_path() {}
-            let cases = match self.algorithm.generate(&op, &mut contention) {
-                Ok(c) => c,
-                Err(Contention) => {
-                    // generation failed due to contention; retry
-                    continue;
+            match self.algorithm.fast_path(&op, &mut contention) {
+                Ok(Some(result)) => {
+                    return result;
                 }
-            };
-            if contention.use_slow_path() {
-                break;
-            }
-
-            let result = self.cas_executor(&cases, &mut contention);
-            if contention.use_slow_path() {
-                break;
-            }
-
-            match self.algorithm.wrap_up(result, &cases, &mut contention) {
-                Ok(Some(outcome)) => return outcome,
                 Ok(None) => {}
                 Err(Contention) => {}
             }
-            if contention.use_slow_path() {
-                break;
-            }
+            //  if contention.use_slow_path() {}
+            // let cases = match self.algorithm.generate(&op, &mut contention) {
+            //     Ok(c) => c,
+            //     Err(Contention) => {
+            //         // generation failed due to contention; retry
+            //         break;
+            //     }
+            // };
+            // if contention.use_slow_path() {
+            //     break;
+            // }
+
+            // let result = match self.cas_executor(&cases, &mut contention) {
+            //     Ok(result) => result,
+            //     Err(Contention) => break,
+            // };
+            // if contention.use_slow_path() {
+            //     break;
+            // }
+
+            // match self.algorithm.wrap_up(result, &cases, &mut contention) {
+            //     Ok(Some(outcome)) => return outcome,
+            //     Ok(None) => {}
+            //     Err(Contention) => {
+            //         break;
+            //     }
+            // }
+            // // if contention.use_slow_path() {
+            //     break;
+            // }
 
             if retry > RETRY_THRESHOLD {
                 break;
@@ -300,7 +558,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
 
             // todo!()
         }
-        unreachable!();
+        // unreachable!();
         //slow path
         //  if let Err(i) = result {
         let i = 0;
